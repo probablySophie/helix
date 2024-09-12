@@ -1,7 +1,7 @@
 // Implementation reference: https://github.com/neovim/neovim/blob/f2906a4669a2eef6d7bf86a29648793d63c98949/runtime/autoload/provider/clipboard.vim#L68-L152
 
-use anyhow::Result;
 use std::borrow::Cow;
+use thiserror::Error;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ClipboardType {
@@ -9,150 +9,331 @@ pub enum ClipboardType {
     Selection,
 }
 
-pub trait ClipboardProvider: std::fmt::Debug {
-    fn name(&self) -> Cow<str>;
-    fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String>;
-    fn set_contents(&mut self, contents: String, clipboard_type: ClipboardType) -> Result<()>;
+#[derive(Debug, Error)]
+pub enum ClipboardError {
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error("could not convert terminal output to UTF-8: {0}")]
+    FromUtf8Error(#[from] std::string::FromUtf8Error),
+    #[error("clipboard provider command failed")]
+    CommandFailed,
+    #[error("failed to write to clipboard provider's stdin")]
+    StdinWriteFailed,
+    #[error("clipboard provider did not return any contents")]
+    MissingStdout,
+    #[error("This clipboard provider does not support reading")]
+    ReadingNotSupported,
 }
 
-#[cfg(not(windows))]
-macro_rules! command_provider {
-    (paste => $get_prg:literal $( , $get_arg:literal )* ; copy => $set_prg:literal $( , $set_arg:literal )* ; ) => {{
-        log::debug!(
-            "Using {} to interact with the system clipboard",
-            if $set_prg != $get_prg { format!("{}+{}", $set_prg, $get_prg)} else { $set_prg.to_string() }
-        );
-        Box::new(provider::command::Provider {
-            get_cmd: provider::command::Config {
-                prg: $get_prg,
-                args: &[ $( $get_arg ),* ],
-            },
-            set_cmd: provider::command::Config {
-                prg: $set_prg,
-                args: &[ $( $set_arg ),* ],
-            },
-            get_primary_cmd: None,
-            set_primary_cmd: None,
-        })
-    }};
+type Result<T> = std::result::Result<T, ClipboardError>;
 
-    (paste => $get_prg:literal $( , $get_arg:literal )* ;
-     copy => $set_prg:literal $( , $set_arg:literal )* ;
-     primary_paste => $pr_get_prg:literal $( , $pr_get_arg:literal )* ;
-     primary_copy => $pr_set_prg:literal $( , $pr_set_arg:literal )* ;
-    ) => {{
-        log::debug!(
-            "Using {} to interact with the system and selection (primary) clipboard",
-            if $set_prg != $get_prg { format!("{}+{}", $set_prg, $get_prg)} else { $set_prg.to_string() }
-        );
-        Box::new(provider::command::Provider {
-            get_cmd: provider::command::Config {
-                prg: $get_prg,
-                args: &[ $( $get_arg ),* ],
-            },
-            set_cmd: provider::command::Config {
-                prg: $set_prg,
-                args: &[ $( $set_arg ),* ],
-            },
-            get_primary_cmd: Some(provider::command::Config {
-                prg: $pr_get_prg,
-                args: &[ $( $pr_get_arg ),* ],
-            }),
-            set_primary_cmd: Some(provider::command::Config {
-                prg: $pr_set_prg,
-                args: &[ $( $pr_set_arg ),* ],
-            }),
-        })
-    }};
-}
-
-#[cfg(windows)]
-pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
-    Box::<provider::WindowsProvider>::default()
-}
-
-#[cfg(target_os = "macos")]
-pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
-    use helix_stdx::env::{binary_exists, env_var_is_set};
-
-    if env_var_is_set("TMUX") && binary_exists("tmux") {
-        command_provider! {
-            paste => "tmux", "save-buffer", "-";
-            copy => "tmux", "load-buffer", "-w", "-";
-        }
-    } else if binary_exists("pbcopy") && binary_exists("pbpaste") {
-        command_provider! {
-            paste => "pbpaste";
-            copy => "pbcopy";
-        }
-    } else {
-        Box::new(provider::FallbackProvider::new())
-    }
-}
+#[cfg(not(target_arch = "wasm32"))]
+pub use external::ClipboardProvider;
+#[cfg(target_arch = "wasm32")]
+pub use noop::ClipboardProvider;
 
 #[cfg(target_arch = "wasm32")]
-pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
-    // TODO:
-    Box::new(provider::FallbackProvider::new())
-}
+mod noop {
+    use super::*;
 
-#[cfg(not(any(windows, target_arch = "wasm32", target_os = "macos")))]
-pub fn get_clipboard_provider() -> Box<dyn ClipboardProvider> {
-    use helix_stdx::env::{binary_exists, env_var_is_set};
-    use provider::command::is_exit_success;
-    // TODO: support for user-defined provider, probably when we have plugin support by setting a
-    // variable?
+    #[derive(Debug, Clone)]
+    pub enum ClipboardProvider {}
 
-    if env_var_is_set("WAYLAND_DISPLAY") && binary_exists("wl-copy") && binary_exists("wl-paste") {
-        command_provider! {
-            paste => "wl-paste", "--no-newline";
-            copy => "wl-copy", "--type", "text/plain";
-            primary_paste => "wl-paste", "-p", "--no-newline";
-            primary_copy => "wl-copy", "-p", "--type", "text/plain";
+    impl ClipboardProvider {
+        pub fn detect() -> Self {
+            Self
         }
-    } else if env_var_is_set("DISPLAY") && binary_exists("xclip") {
-        command_provider! {
-            paste => "xclip", "-o", "-selection", "clipboard";
-            copy => "xclip", "-i", "-selection", "clipboard";
-            primary_paste => "xclip", "-o";
-            primary_copy => "xclip", "-i";
+
+        pub fn name(&self) -> Cow<str> {
+            "none".into()
         }
-    } else if env_var_is_set("DISPLAY")
-        && binary_exists("xsel")
-        && is_exit_success("xsel", &["-o", "-b"])
-    {
-        // FIXME: check performance of is_exit_success
-        command_provider! {
-            paste => "xsel", "-o", "-b";
-            copy => "xsel", "-i", "-b";
-            primary_paste => "xsel", "-o";
-            primary_copy => "xsel", "-i";
+
+        pub fn get_contents(&self, _clipboard_type: ClipboardType) -> Result<String> {
+            Err(ClipboardError::ReadingNotSupported)
         }
-    } else if binary_exists("win32yank.exe") {
-        command_provider! {
-            paste => "win32yank.exe", "-o", "--lf";
-            copy => "win32yank.exe", "-i", "--crlf";
+
+        pub fn set_contents(&self, _content: &str, _clipboard_type: ClipboardType) -> Result<()> {
+            Ok(())
         }
-    } else if binary_exists("termux-clipboard-set") && binary_exists("termux-clipboard-get") {
-        command_provider! {
-            paste => "termux-clipboard-get";
-            copy => "termux-clipboard-set";
-        }
-    } else if env_var_is_set("TMUX") && binary_exists("tmux") {
-        command_provider! {
-            paste => "tmux", "save-buffer", "-";
-            copy => "tmux", "load-buffer", "-w", "-";
-        }
-    } else {
-        Box::new(provider::FallbackProvider::new())
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub mod provider {
-    use super::{ClipboardProvider, ClipboardType};
-    use anyhow::Result;
-    use std::borrow::Cow;
+/// Interaction with external clipboard providers.
+#[cfg(not(target_arch = "wasm32"))]
+mod external {
+    use super::*;
+
+    #[derive(Debug, Default, Clone)]
+    pub enum ClipboardProvider {
+        Termux,
+        Tmux,
+        /// MacOS `pbcopy`+`pbpaste`
+        Pasteboard,
+        /// Wayland clipboard `wl-clipboard`
+        WlClipboard,
+        XClip,
+        XSel,
+        Win32Yank,
+        #[cfg(target_os = "windows")]
+        ClipboardWin,
+        /// A provider which uses the OSC52 terminal escape codes.
+        /// This provider does not support reading.
+        #[cfg(feature = "term")]
+        Termcode,
+        #[default]
+        None,
+    }
+
+    impl ClipboardProvider {
+        #[cfg(windows)]
+        pub fn detect() -> Self {
+            if binary_exists("win32yank.exe") {
+                Self::Win32Yank
+            } else {
+                Self::Windows
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        pub fn detect() -> Self {
+            use helix_stdx::env::{binary_exists, env_var_is_set};
+
+            if env_var_is_set("TMUX") && binary_exists("tmux") {
+                Self::Tmux
+            } else if binary_exists("pbcopy") && binary_exists("pbpaste") {
+                Self::Pasteboard
+            } else if cfg!(feature = "term") {
+                Self::Termcode
+            } else {
+                Self::default()
+            }
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        pub fn detect() -> Self {
+            use helix_stdx::env::{binary_exists, env_var_is_set};
+
+            fn is_exit_success(program: &str, args: &[&str]) -> bool {
+                std::process::Command::new(program)
+                    .args(args)
+                    .output()
+                    .ok()
+                    .and_then(|out| out.status.success().then_some(()))
+                    .is_some()
+            }
+
+            // TODO: support for user-defined provider, probably when we have plugin support by setting a
+            // variable?
+
+            if env_var_is_set("WAYLAND_DISPLAY")
+                && binary_exists("wl-copy")
+                && binary_exists("wl-paste")
+            {
+                Self::WlClipboard
+            } else if env_var_is_set("DISPLAY") && binary_exists("xclip") {
+                Self::XClip
+            } else if env_var_is_set("DISPLAY")
+                && binary_exists("xsel")
+                // FIXME: check performance of is_exit_success
+                && is_exit_success("xsel", &["-o", "-b"])
+            {
+                Self::XSel
+            } else if binary_exists("termux-clipboard-set") && binary_exists("termux-clipboard-get")
+            {
+                Self::Termux
+            } else if env_var_is_set("TMUX") && binary_exists("tmux") {
+                Self::Tmux
+            } else if binary_exists("win32yank.exe") {
+                Self::Win32Yank
+            } else if cfg!(feature = "term") {
+                Self::Termcode
+            } else {
+                Self::default()
+            }
+        }
+
+        pub fn name(&self) -> Cow<str> {
+            fn builtin_name(provider: CommandProvider<'_>) -> Cow<'_, str> {
+                if provider.yank.command != provider.paste.command {
+                    Cow::Owned(format!(
+                        "{}+{}",
+                        provider.yank.command, provider.paste.command
+                    ))
+                } else {
+                    provider.yank.command
+                }
+            }
+
+            match self {
+                Self::Termux => todo!(),
+                Self::Tmux => builtin_name(TMUX),
+                Self::Pasteboard => builtin_name(PASTEBOARD),
+                Self::WlClipboard => builtin_name(WL_CLIPBOARD),
+                Self::XClip => todo!(),
+                Self::XSel => todo!(),
+                Self::Win32Yank => todo!(),
+                #[cfg(target_os = "windows")]
+                Self::ClipboardWin => "clipboard-win".into(),
+                #[cfg(feature = "term")]
+                Self::Termcode => "termcode".into(),
+                Self::None => "none".into(),
+            }
+        }
+
+        pub fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
+            fn yank_from_builtin(
+                provider: CommandProvider,
+                clipboard_type: ClipboardType,
+            ) -> Result<String> {
+                match clipboard_type {
+                    ClipboardType::Clipboard => execute_command(&provider.yank, None, true)?
+                        .ok_or(ClipboardError::MissingStdout),
+                    ClipboardType::Selection => {
+                        if let Some(cmd) = provider.yank_primary.as_ref() {
+                            return execute_command(cmd, None, true)?
+                                .ok_or(ClipboardError::MissingStdout);
+                        }
+
+                        Ok(String::new())
+                    }
+                }
+            }
+
+            match self {
+                Self::Tmux => yank_from_builtin(TMUX, clipboard_type),
+                Self::Pasteboard => yank_from_builtin(PASTEBOARD, clipboard_type),
+                Self::WlClipboard => yank_from_builtin(WL_CLIPBOARD, clipboard_type),
+                #[cfg(target_os = "windows")]
+                Self::ClipboardWin => match clipboard_type {
+                    ClipboardType::Clipboard => {
+                        let contents =
+                            clipboard_win::get_clipboard(clipboard_win::formats::Unicode)?;
+                        Ok(contents)
+                    }
+                    ClipboardType::Selection => Ok(String::new()),
+                },
+                Self::Termcode | Self::None => Err(ClipboardError::ReadingNotSupported),
+                _ => todo!(),
+            }
+        }
+
+        pub fn set_contents(&self, content: &str, clipboard_type: ClipboardType) -> Result<()> {
+            fn paste_to_builtin(
+                provider: CommandProvider,
+                content: &str,
+                clipboard_type: ClipboardType,
+            ) -> Result<()> {
+                let cmd = match clipboard_type {
+                    ClipboardType::Clipboard => &provider.paste,
+                    ClipboardType::Selection => {
+                        if let Some(cmd) = provider.paste_primary.as_ref() {
+                            cmd
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                };
+
+                execute_command(cmd, Some(content), false).map(|_| ())
+            }
+
+            match self {
+                Self::Tmux => paste_to_builtin(TMUX, content, clipboard_type),
+                Self::Pasteboard => paste_to_builtin(PASTEBOARD, content, clipboard_type),
+                Self::WlClipboard => paste_to_builtin(WL_CLIPBOARD, content, clipboard_type),
+                #[cfg(target_os = "windows")]
+                Self::ClipboardWin => match clipboard_type {
+                    ClipboardType::Clipboard => {
+                        clipboard_win::set_clipboard(clipboard_win::formats::Unicode, contents)?;
+                    }
+                    ClipboardType::Selection => (),
+                },
+                #[cfg(feature = "term")]
+                Self::Termcode => {
+                    crossterm::queue!(
+                        std::io::stdout(),
+                        osc52::SetClipboardCommand::new(content, clipboard_type)
+                    )?;
+                    Ok(())
+                }
+                Self::None => Ok(()),
+                _ => todo!(),
+            }
+        }
+    }
+
+    struct CommandProvider<'a> {
+        yank: Command<'a>,
+        paste: Command<'a>,
+        yank_primary: Option<Command<'a>>,
+        paste_primary: Option<Command<'a>>,
+    }
+
+    struct Command<'a> {
+        command: Cow<'a, str>,
+        args: Cow<'a, [Cow<'a, str>]>,
+    }
+
+    macro_rules! command_provider {
+        ($name:ident,
+         yank => $yank_cmd:literal $( , $yank_arg:literal )* ;
+         paste => $paste_cmd:literal $( , $paste_arg:literal )* ; ) => {
+            const $name: CommandProvider = CommandProvider {
+                yank: Command {
+                    command: Cow::Borrowed($yank_cmd),
+                    args: Cow::Borrowed(&[ $( Cow::Borrowed($yank_arg) ),* ])
+                },
+                paste: Command {
+                    command: Cow::Borrowed($paste_cmd),
+                    args: Cow::Borrowed(&[ $( Cow::Borrowed($paste_arg) ),* ])
+                },
+                yank_primary: None,
+                paste_primary: None,
+            };
+        };
+        ($name:ident,
+         yank => $yank_cmd:literal $( , $yank_arg:literal )* ;
+         paste => $paste_cmd:literal $( , $paste_arg:literal )* ;
+         yank_primary => $yank_primary_cmd:literal $( , $yank_primary_arg:literal )* ;
+         paste_primary => $paste_primary_cmd:literal $( , $paste_primary_arg:literal )* ; ) => {
+            const $name: CommandProvider = CommandProvider {
+                yank: Command {
+                    command: Cow::Borrowed($yank_cmd),
+                    args: Cow::Borrowed(&[ $( Cow::Borrowed($yank_arg) ),* ])
+                },
+                paste: Command {
+                    command: Cow::Borrowed($paste_cmd),
+                    args: Cow::Borrowed(&[ $( Cow::Borrowed($paste_arg) ),* ])
+                },
+                yank_primary: Some(Command {
+                    command: Cow::Borrowed($yank_primary_cmd),
+                    args: Cow::Borrowed(&[ $( Cow::Borrowed($yank_primary_arg) ),* ])
+                }),
+                paste_primary: Some(Command {
+                    command: Cow::Borrowed($paste_primary_cmd),
+                    args: Cow::Borrowed(&[ $( Cow::Borrowed($paste_primary_arg) ),* ])
+                }),
+            };
+        };
+    }
+
+    command_provider! {
+        TMUX,
+        yank => "tmux", "load-buffer", "-w", "-";
+        paste => "tmux", "save-buffer", "-";
+    }
+    command_provider! {
+        PASTEBOARD,
+        yank => "pbcopy";
+        paste => "pbpaste";
+    }
+    command_provider! {
+        WL_CLIPBOARD,
+        yank => "wl-copy", "--type", "text/plain";
+        paste => "wl-paste", "--no-newline";
+        yank_primary => "wl-copy", "-p", "--type", "text/plain";
+        paste_primary => "wl-paste", "-p", "--no-newline";
+    }
 
     #[cfg(feature = "term")]
     mod osc52 {
@@ -185,229 +366,62 @@ pub mod provider {
         }
     }
 
-    #[derive(Debug)]
-    pub struct FallbackProvider {
-        buf: String,
-        primary_buf: String,
-    }
+    fn execute_command(
+        cmd: &Command,
+        input: Option<&str>,
+        pipe_output: bool,
+    ) -> Result<Option<String>> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
 
-    impl FallbackProvider {
-        pub fn new() -> Self {
-            #[cfg(feature = "term")]
-            log::debug!(
-                "No native clipboard provider found. Yanking by OSC 52 and pasting will be internal to Helix"
+        let stdin = input.map(|_| Stdio::piped()).unwrap_or_else(Stdio::null);
+        let stdout = pipe_output.then(Stdio::piped).unwrap_or_else(Stdio::null);
+
+        let mut command: Command = Command::new(cmd.command.as_ref());
+
+        let mut command_mut: &mut Command = command
+            .args(cmd.args.iter().map(AsRef::as_ref))
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(Stdio::null());
+
+        // Fix for https://github.com/helix-editor/helix/issues/5424
+        if cfg!(unix) {
+            use std::os::unix::process::CommandExt;
+
+            unsafe {
+                command_mut = command_mut.pre_exec(|| match libc::setsid() {
+                    -1 => Err(std::io::Error::last_os_error()),
+                    _ => Ok(()),
+                });
+            }
+        }
+
+        let mut child = command_mut.spawn()?;
+
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().ok_or(ClipboardError::StdinWriteFailed)?;
+            stdin
+                .write_all(input.as_bytes())
+                .map_err(|_| ClipboardError::StdinWriteFailed)?;
+        }
+
+        // TODO: add timer?
+        let output = child.wait_with_output()?;
+
+        if !output.status.success() {
+            log::error!(
+                "clipboard provider {} failed with stderr: \"{}\"",
+                cmd.command.as_ref(),
+                String::from_utf8_lossy(&output.stderr)
             );
-            #[cfg(not(feature = "term"))]
-            log::warn!(
-                "No native clipboard provider found! Yanking and pasting will be internal to Helix"
-            );
-            Self {
-                buf: String::new(),
-                primary_buf: String::new(),
-            }
-        }
-    }
-
-    impl Default for FallbackProvider {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl ClipboardProvider for FallbackProvider {
-        #[cfg(feature = "term")]
-        fn name(&self) -> Cow<str> {
-            Cow::Borrowed("termcode")
+            return Err(ClipboardError::CommandFailed);
         }
 
-        #[cfg(not(feature = "term"))]
-        fn name(&self) -> Cow<str> {
-            Cow::Borrowed("none")
-        }
-
-        fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
-            // This is the same noop if term is enabled or not.
-            // We don't use the get side of OSC 52 as it isn't often enabled, it's a security hole,
-            // and it would require this to be async to listen for the response
-            let value = match clipboard_type {
-                ClipboardType::Clipboard => self.buf.clone(),
-                ClipboardType::Selection => self.primary_buf.clone(),
-            };
-
-            Ok(value)
-        }
-
-        fn set_contents(&mut self, content: String, clipboard_type: ClipboardType) -> Result<()> {
-            #[cfg(feature = "term")]
-            crossterm::execute!(
-                std::io::stdout(),
-                osc52::SetClipboardCommand::new(&content, clipboard_type)
-            )?;
-            // Set our internal variables to use in get_content regardless of using OSC 52
-            match clipboard_type {
-                ClipboardType::Clipboard => self.buf = content,
-                ClipboardType::Selection => self.primary_buf = content,
-            }
-            Ok(())
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub mod command {
-        use super::*;
-        use anyhow::{bail, Context as _};
-
-        #[cfg(not(any(windows, target_os = "macos")))]
-        pub fn is_exit_success(program: &str, args: &[&str]) -> bool {
-            std::process::Command::new(program)
-                .args(args)
-                .output()
-                .ok()
-                .and_then(|out| out.status.success().then_some(()))
-                .is_some()
-        }
-
-        #[derive(Debug)]
-        pub struct Config {
-            pub prg: &'static str,
-            pub args: &'static [&'static str],
-        }
-
-        impl Config {
-            fn execute(&self, input: Option<&str>, pipe_output: bool) -> Result<Option<String>> {
-                use std::io::Write;
-                use std::process::{Command, Stdio};
-
-                let stdin = input.map(|_| Stdio::piped()).unwrap_or_else(Stdio::null);
-                let stdout = pipe_output.then(Stdio::piped).unwrap_or_else(Stdio::null);
-
-                let mut command: Command = Command::new(self.prg);
-
-                let mut command_mut: &mut Command = command
-                    .args(self.args)
-                    .stdin(stdin)
-                    .stdout(stdout)
-                    .stderr(Stdio::null());
-
-                // Fix for https://github.com/helix-editor/helix/issues/5424
-                if cfg!(unix) {
-                    use std::os::unix::process::CommandExt;
-
-                    unsafe {
-                        command_mut = command_mut.pre_exec(|| match libc::setsid() {
-                            -1 => Err(std::io::Error::last_os_error()),
-                            _ => Ok(()),
-                        });
-                    }
-                }
-
-                let mut child = command_mut.spawn()?;
-
-                if let Some(input) = input {
-                    let mut stdin = child.stdin.take().context("stdin is missing")?;
-                    stdin
-                        .write_all(input.as_bytes())
-                        .context("couldn't write in stdin")?;
-                }
-
-                // TODO: add timer?
-                let output = child.wait_with_output()?;
-
-                if !output.status.success() {
-                    bail!("clipboard provider {} failed", self.prg);
-                }
-
-                if pipe_output {
-                    Ok(Some(String::from_utf8(output.stdout)?))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
-
-        #[derive(Debug)]
-        pub struct Provider {
-            pub get_cmd: Config,
-            pub set_cmd: Config,
-            pub get_primary_cmd: Option<Config>,
-            pub set_primary_cmd: Option<Config>,
-        }
-
-        impl ClipboardProvider for Provider {
-            fn name(&self) -> Cow<str> {
-                if self.get_cmd.prg != self.set_cmd.prg {
-                    Cow::Owned(format!("{}+{}", self.get_cmd.prg, self.set_cmd.prg))
-                } else {
-                    Cow::Borrowed(self.get_cmd.prg)
-                }
-            }
-
-            fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
-                match clipboard_type {
-                    ClipboardType::Clipboard => Ok(self
-                        .get_cmd
-                        .execute(None, true)?
-                        .context("output is missing")?),
-                    ClipboardType::Selection => {
-                        if let Some(cmd) = &self.get_primary_cmd {
-                            return cmd.execute(None, true)?.context("output is missing");
-                        }
-
-                        Ok(String::new())
-                    }
-                }
-            }
-
-            fn set_contents(&mut self, value: String, clipboard_type: ClipboardType) -> Result<()> {
-                let cmd = match clipboard_type {
-                    ClipboardType::Clipboard => &self.set_cmd,
-                    ClipboardType::Selection => {
-                        if let Some(cmd) = &self.set_primary_cmd {
-                            cmd
-                        } else {
-                            return Ok(());
-                        }
-                    }
-                };
-                cmd.execute(Some(&value), false).map(|_| ())
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod provider {
-    use super::{ClipboardProvider, ClipboardType};
-    use anyhow::Result;
-    use std::borrow::Cow;
-
-    #[derive(Default, Debug)]
-    pub struct WindowsProvider;
-
-    impl ClipboardProvider for WindowsProvider {
-        fn name(&self) -> Cow<str> {
-            log::debug!("Using clipboard-win to interact with the system clipboard");
-            Cow::Borrowed("clipboard-win")
-        }
-
-        fn get_contents(&self, clipboard_type: ClipboardType) -> Result<String> {
-            match clipboard_type {
-                ClipboardType::Clipboard => {
-                    let contents = clipboard_win::get_clipboard(clipboard_win::formats::Unicode)?;
-                    Ok(contents)
-                }
-                ClipboardType::Selection => Ok(String::new()),
-            }
-        }
-
-        fn set_contents(&mut self, contents: String, clipboard_type: ClipboardType) -> Result<()> {
-            match clipboard_type {
-                ClipboardType::Clipboard => {
-                    clipboard_win::set_clipboard(clipboard_win::formats::Unicode, contents)?;
-                }
-                ClipboardType::Selection => {}
-            };
-            Ok(())
+        if pipe_output {
+            Ok(Some(String::from_utf8(output.stdout)?))
+        } else {
+            Ok(None)
         }
     }
 }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use helix_core::NATIVE_LINE_ENDING;
 
 use crate::{
-    clipboard::{get_clipboard_provider, ClipboardProvider, ClipboardType},
+    clipboard::{ClipboardError, ClipboardProvider, ClipboardType},
     Editor,
 };
 
@@ -27,7 +27,7 @@ pub struct Registers {
     /// The order is reversed again in `Registers::read`. This allows us to
     /// efficiently prepend new values in `Registers::push`.
     inner: HashMap<char, Vec<String>>,
-    clipboard_provider: Box<dyn ClipboardProvider>,
+    clipboard_provider: ClipboardProvider,
     pub last_search_register: char,
 }
 
@@ -35,7 +35,8 @@ impl Default for Registers {
     fn default() -> Self {
         Self {
             inner: Default::default(),
-            clipboard_provider: get_clipboard_provider(),
+            // TODO: take this value from configuration? an arc_swap access?
+            clipboard_provider: ClipboardProvider::detect(),
             last_search_register: '/',
         }
     }
@@ -64,7 +65,7 @@ impl Registers {
                 Some(RegisterValues::new(iter::once(path)))
             }
             '*' | '+' => Some(read_from_clipboard(
-                self.clipboard_provider.as_ref(),
+                &self.clipboard_provider,
                 self.inner.get(&name),
                 match name {
                     '+' => ClipboardType::Clipboard,
@@ -85,7 +86,7 @@ impl Registers {
             '#' | '.' | '%' => Err(anyhow::anyhow!("Register {name} does not support writing")),
             '*' | '+' => {
                 self.clipboard_provider.set_contents(
-                    values.join(NATIVE_LINE_ENDING.as_str()),
+                    &values.join(NATIVE_LINE_ENDING.as_str()),
                     match name {
                         '+' => ClipboardType::Clipboard,
                         '*' => ClipboardType::Selection,
@@ -127,7 +128,7 @@ impl Registers {
                 }
                 value.push_str(&contents);
                 self.clipboard_provider
-                    .set_contents(value, clipboard_type)?;
+                    .set_contents(&value, clipboard_type)?;
 
                 Ok(())
             }
@@ -196,10 +197,7 @@ impl Registers {
     }
 
     fn clear_clipboard(&mut self, clipboard_type: ClipboardType) {
-        if let Err(err) = self
-            .clipboard_provider
-            .set_contents("".into(), clipboard_type)
-        {
+        if let Err(err) = self.clipboard_provider.set_contents("", clipboard_type) {
             log::error!(
                 "Failed to clear {} clipboard: {err}",
                 match clipboard_type {
@@ -216,7 +214,7 @@ impl Registers {
 }
 
 fn read_from_clipboard<'a>(
-    provider: &dyn ClipboardProvider,
+    provider: &ClipboardProvider,
     saved_values: Option<&'a Vec<String>>,
     clipboard_type: ClipboardType,
 ) -> RegisterValues<'a> {
@@ -235,6 +233,10 @@ fn read_from_clipboard<'a>(
                 RegisterValues::new(iter::once(contents.into()))
             }
         }
+        Err(ClipboardError::ReadingNotSupported) => match saved_values {
+            Some(values) => RegisterValues::new(values.iter().map(Cow::from).rev()),
+            None => RegisterValues::new(iter::once("".into())),
+        },
         Err(err) => {
             log::error!(
                 "Failed to read {} clipboard: {err}",

@@ -35,8 +35,9 @@ pub use noop::ClipboardProvider;
 #[cfg(target_arch = "wasm32")]
 mod noop {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Deserialize, Serialize)]
     pub enum ClipboardProvider {}
 
     impl ClipboardProvider {
@@ -61,9 +62,12 @@ mod noop {
 /// Interaction with external clipboard providers.
 #[cfg(not(target_arch = "wasm32"))]
 mod external {
+    use serde::{Deserialize, Serialize};
+
     use super::*;
 
-    #[derive(Debug, Default, Clone)]
+    #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[serde(rename = "kebab-case")]
     pub enum ClipboardProvider {
         Termux,
         Tmux,

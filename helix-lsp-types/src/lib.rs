@@ -18,8 +18,7 @@ use serde_json::Value;
 pub struct Url(String);
 
 impl Url {
-    #[allow(clippy::result_unit_err)]
-    pub fn from_file_path<P: AsRef<Path>>(path: P) -> Result<Self, ()> {
+    pub fn from_file_path<P: AsRef<Path>>(path: P) -> Self {
         use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
         #[cfg(any(unix, target_os = "redox"))]
         use std::os::unix::prelude::OsStrExt;
@@ -60,16 +59,15 @@ impl Url {
             // An URL's path must not be empty.
             serialization.push('/');
         }
-        Ok(Self(serialization))
+        Self(serialization)
     }
 
-    #[allow(clippy::result_unit_err)]
-    pub fn from_directory_path<P: AsRef<Path>>(path: P) -> Result<Self, ()> {
-        let Self(mut serialization) = Self::from_file_path(path)?;
+    pub fn from_directory_path<P: AsRef<Path>>(path: P) -> Self {
+        let Self(mut serialization) = Self::from_file_path(path);
         if !serialization.ends_with('/') {
             serialization.push('/');
         }
-        Ok(Self(serialization))
+        Self(serialization)
     }
 
     /// Returns the serialized representation of the URL as a `&str`
